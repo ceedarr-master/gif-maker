@@ -5,6 +5,9 @@ const fs = require('fs');
 const OUTPUT_DIR = path.join(__dirname, '..', 'output');
 const MAX_SIZE_BYTES = 15 * 1024 * 1024; // 15MB
 
+// FPS-only reduction ladder (high → low)
+const FPS_LADDER = [30, 24, 20, 15, 12, 10, 8, 6];
+
 /**
  * Parse HH:MM:SS.ss or MM:SS.ss time string to seconds
  */
@@ -17,10 +20,10 @@ function parseTime(timeStr) {
 }
 
 /**
- * Get video duration in seconds using ffprobe
+ * Get video info (duration, width, height) using ffprobe
  */
-function getVideoDuration(inputPath) {
-  return new Promise((resolve, reject) => {
+function getVideoInfo(inputPath) {
+  return new Promise((resolve) => {
     const proc = spawn('ffprobe', [
       '-v', 'quiet',
       '-print_format', 'json',
@@ -34,10 +37,12 @@ function getVideoDuration(inputPath) {
       try {
         const info = JSON.parse(out);
         const videoStream = info.streams.find(s => s.codec_type === 'video');
-        const duration = videoStream
-          ? parseFloat(videoStream.duration || 0)
-          : parseFloat((info.streams[0] || {}).duration || 0);
-        resolve(duration || null);
+        if (!videoStream) return resolve(null);
+        resolve({
+          duration: parseFloat(videoStream.duration || 0) || null,
+          width: videoStream.width || 0,
+          height: videoStream.height || 0,
+        });
       } catch (e) {
         resolve(null);
       }
@@ -47,7 +52,6 @@ function getVideoDuration(inputPath) {
 
 /**
  * Run an ffmpeg command, parse progress from stderr.
- * onProgress(percent) called during encoding with 0-100 values.
  */
 function runFFmpeg(args, totalDuration, onProgress) {
   return new Promise((resolve, reject) => {
@@ -78,20 +82,36 @@ function runFFmpeg(args, totalDuration, onProgress) {
 }
 
 /**
+ * Build the eq + optional unsharp filter string for correction.
+ */
+function buildCorrectionFilters({ brightness = 0, contrast = 1, saturation = 1, sharpLuma = 0, sharpChroma = 0 }) {
+  const eq = `eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`;
+  const useUnsharp = sharpLuma !== 0 || sharpChroma !== 0;
+  const unsharp = useUnsharp ? `,unsharp=5:5:${sharpLuma}:3:3:${sharpChroma}` : '';
+  return eq + unsharp;
+}
+
+/**
  * Two-pass high-quality GIF generation using palettegen + paletteuse.
  *
- * @param {string} inputPath  - Path to source video
- * @param {string} outputPath - Path for output GIF
- * @param {string} palettePath - Path for intermediate palette PNG
- * @param {object} params     - { startTime, duration, fps, width }
+ * @param {string} inputPath    - Path to source video
+ * @param {string} outputPath   - Path for output GIF
+ * @param {string} palettePath  - Path for intermediate palette PNG
+ * @param {object} params       - { startTime, duration, fps, width, brightness, contrast, saturation, sharpLuma, sharpChroma }
  * @param {function} onProgress - (percent 0-100) callback
  */
 async function twoPassGif(inputPath, outputPath, palettePath, params, onProgress) {
-  const { startTime, duration, fps, width } = params;
+  const {
+    startTime, duration, fps, width,
+    brightness = 0, contrast = 1, saturation = 1, sharpLuma = 0, sharpChroma = 0,
+  } = params;
 
+  // -2 ensures even height (required by GIF format); 0 = preserve original
   const scaleFilter = width > 0
-    ? `scale=${width}:-1:flags=lanczos`
-    : 'scale=iw:-1:flags=lanczos';
+    ? `scale=${width}:-2:flags=lanczos`
+    : 'scale=iw:ih:flags=lanczos';
+
+  const corrFilters = buildCorrectionFilters({ brightness, contrast, saturation, sharpLuma, sharpChroma });
 
   const baseArgs = [
     '-ss', String(startTime),
@@ -103,7 +123,7 @@ async function twoPassGif(inputPath, outputPath, palettePath, params, onProgress
   onProgress && onProgress(0);
   await runFFmpeg([
     ...baseArgs,
-    '-vf', `fps=${fps},${scaleFilter},palettegen=max_colors=256:stats_mode=diff`,
+    '-vf', `fps=${fps},${scaleFilter},${corrFilters},palettegen=max_colors=256:stats_mode=diff`,
     '-y', palettePath,
   ], duration, null);
   onProgress && onProgress(20);
@@ -112,10 +132,9 @@ async function twoPassGif(inputPath, outputPath, palettePath, params, onProgress
   await runFFmpeg([
     ...baseArgs,
     '-i', palettePath,
-    '-lavfi', `fps=${fps},${scaleFilter} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle`,
+    '-lavfi', `fps=${fps},${scaleFilter},${corrFilters} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle`,
     '-y', outputPath,
   ], duration, (pct) => {
-    // Map 0-100% of pass 2 to overall 20-100%
     onProgress && onProgress(20 + Math.round(pct * 0.80));
   });
 }
@@ -123,10 +142,10 @@ async function twoPassGif(inputPath, outputPath, palettePath, params, onProgress
 /**
  * Main conversion function.
  *
- * @param {string}   jobId      - Unique job identifier
- * @param {string}   inputPath  - Path to uploaded video
- * @param {object}   options    - { startTime, endTime, fps, width }
- * @param {function} emit       - (eventType, data) SSE callback
+ * @param {string}   jobId     - Unique job identifier
+ * @param {string}   inputPath - Path to uploaded video
+ * @param {object}   options   - { startTime, endTime, fps, width, brightness, contrast, saturation, sharpLuma, sharpChroma, skipFpsLadder }
+ * @param {function} emit      - (eventType, data) SSE callback
  */
 async function convert(jobId, inputPath, options, emit) {
   const outputPath = path.join(OUTPUT_DIR, `${jobId}.gif`);
@@ -134,8 +153,12 @@ async function convert(jobId, inputPath, options, emit) {
 
   emit('progress', { stage: 'init', percent: 0, message: '동영상 정보를 읽는 중...' });
 
-  // Determine video duration
-  const videoDuration = await getVideoDuration(inputPath);
+  const videoInfo = await getVideoInfo(inputPath);
+  if (videoInfo) {
+    emit('info', { width: videoInfo.width, height: videoInfo.height });
+  }
+
+  const videoDuration = videoInfo ? videoInfo.duration : null;
   const startTime = Math.max(0, options.startTime || 0);
   let endTime = options.endTime;
   if (!endTime || endTime <= startTime) {
@@ -144,120 +167,132 @@ async function convert(jobId, inputPath, options, emit) {
   if (videoDuration && endTime > videoDuration) {
     endTime = videoDuration;
   }
-  let duration = Math.max(0.5, endTime - startTime);
+  const duration = Math.max(0.5, endTime - startTime);
 
-  let fps = options.fps || 15;
-  let width = options.width || 480;
+  const corrections = {
+    brightness: options.brightness || 0,
+    contrast: options.contrast != null ? options.contrast : 1,
+    saturation: options.saturation != null ? options.saturation : 1,
+    sharpLuma: options.sharpLuma || 0,
+    sharpChroma: options.sharpChroma || 0,
+  };
 
-  // Reduction ladder: attempts to bring file under 15MB
-  const MAX_ATTEMPTS = 7;
-  const reductionSteps = [
-    null, // attempt 1: user settings
-    (p) => { p.fps = Math.max(6, Math.floor(p.fps * 0.75)); },
-    (p) => { p.width = Math.floor(p.width * 0.80); },
-    (p) => { p.fps = Math.max(6, Math.floor(p.fps * 0.75)); },
-    (p) => { p.width = Math.floor(p.width * 0.65); },
-    (p) => { p.duration = Math.floor(p.duration * 0.80); },
-  ];
+  // 0 = preserve original dimensions
+  const width = options.width || 0;
+  const userFps = options.fps || 15;
 
-  let lastError = null;
-
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    if (attempt > 0 && reductionSteps[attempt]) {
-      const params = { fps, width, duration };
-      reductionSteps[attempt](params);
-      fps = params.fps;
-      width = params.width;
-      duration = params.duration;
-
-      emit('resize', {
-        attempt,
-        message: `파일 크기 초과 — FPS ${fps}, 너비 ${width}px, ${duration.toFixed(1)}초로 재시도 중...`,
+  // --- Resolution retry: single attempt, then error ---
+  if (options.skipFpsLadder) {
+    emit('progress', { stage: 'palette', percent: 5, message: '색상 팔레트 생성 중...' });
+    try {
+      await twoPassGif(inputPath, outputPath, palettePath, { startTime, duration, fps: userFps, width, ...corrections }, (pct) => {
+        emit('progress', {
+          stage: pct < 20 ? 'palette' : 'encode',
+          percent: pct,
+          message: pct < 20 ? '색상 팔레트 생성 중...' : `GIF 인코딩 중... ${pct}%`,
+        });
       });
+    } catch (err) {
+      try { fs.unlinkSync(palettePath); } catch (e) {}
+      try { fs.unlinkSync(outputPath); } catch (e) {}
+      emit('error', { message: err.message });
+      return;
+    }
+    try { fs.unlinkSync(palettePath); } catch (e) {}
+
+    let sizeBytes;
+    try { sizeBytes = fs.statSync(outputPath).size; } catch (e) {
+      emit('error', { message: 'GIF 파일 생성에 실패했습니다.' });
+      return;
+    }
+
+    if (sizeBytes <= MAX_SIZE_BYTES) {
+      emit('progress', { stage: 'done', percent: 100, message: '완료!' });
+      emit('complete', { outputPath, sizeBytes, sizeLabel: formatSize(sizeBytes), width, fps: userFps, duration: parseFloat(duration.toFixed(2)) });
+    } else {
+      try { fs.unlinkSync(outputPath); } catch (e) {}
+      emit('error', { message: `${formatSize(sizeBytes)} — 해상도를 줄여도 15MB 이하로 줄일 수 없습니다.` });
+    }
+    return;
+  }
+
+  // --- FPS-only reduction ladder ---
+  // Start at or below user-requested FPS
+  const fpsLadder = FPS_LADDER.filter(f => f <= userFps);
+  if (fpsLadder.length === 0) fpsLadder.push(userFps);
+
+  let anySucceeded = false;
+  let lastSizeBytes = 0;
+
+  for (let i = 0; i < fpsLadder.length; i++) {
+    const fps = fpsLadder[i];
+
+    if (i > 0) {
+      emit('resize', { attempt: i, fps, message: `파일 크기 초과 — FPS ${fps}로 재시도 중...` });
     }
 
     emit('progress', {
-      stage: attempt === 0 ? 'palette' : 'retry-palette',
-      percent: attempt === 0 ? 5 : 5,
-      message: attempt === 0
-        ? '색상 팔레트 생성 중...'
-        : `재시도 ${attempt}: 색상 팔레트 생성 중...`,
+      stage: i === 0 ? 'palette' : 'retry-palette',
+      percent: 5,
+      message: i === 0 ? '색상 팔레트 생성 중...' : `재시도 ${i}: 색상 팔레트 생성 중...`,
     });
 
     try {
       await twoPassGif(
-        inputPath,
-        outputPath,
-        palettePath,
-        { startTime, duration, fps, width },
+        inputPath, outputPath, palettePath,
+        { startTime, duration, fps, width, ...corrections },
         (pct) => {
           emit('progress', {
             stage: pct < 20 ? 'palette' : 'encode',
             percent: pct,
-            message: pct < 20
-              ? '색상 팔레트 생성 중...'
-              : `GIF 인코딩 중... ${pct}%`,
+            message: pct < 20 ? '색상 팔레트 생성 중...' : `GIF 인코딩 중... ${pct}%`,
           });
         }
       );
     } catch (err) {
-      lastError = err;
-      // Try cleanup and continue to next attempt if possible
       try { fs.unlinkSync(palettePath); } catch (e) {}
       try { fs.unlinkSync(outputPath); } catch (e) {}
-      if (attempt >= MAX_ATTEMPTS - 1) break;
-      continue;
+      continue; // try next FPS
     }
 
-    // Clean up palette
     try { fs.unlinkSync(palettePath); } catch (e) {}
 
-    // Check output file size
     let sizeBytes;
     try {
       sizeBytes = fs.statSync(outputPath).size;
     } catch (e) {
-      lastError = new Error('GIF 파일 생성에 실패했습니다.');
-      break;
+      emit('error', { message: 'GIF 파일 생성에 실패했습니다.' });
+      return;
     }
+
+    anySucceeded = true;
+    lastSizeBytes = sizeBytes;
 
     if (sizeBytes <= MAX_SIZE_BYTES) {
-      // Success!
-      const sizeLabel = formatSize(sizeBytes);
       emit('progress', { stage: 'done', percent: 100, message: '완료!' });
       emit('complete', {
-        outputPath,
-        sizeBytes,
-        sizeLabel,
-        width,
-        fps,
-        duration: parseFloat(duration.toFixed(2)),
+        outputPath, sizeBytes, sizeLabel: formatSize(sizeBytes),
+        width, fps, duration: parseFloat(duration.toFixed(2)),
       });
       return;
     }
 
-    // File too large — try next reduction step
-    if (attempt >= reductionSteps.length - 1) {
-      // No more reduction steps
-      emit('error', {
-        message: `${formatSize(sizeBytes)} — 15MB 이하로 줄일 수 없습니다. 더 짧은 구간이나 작은 해상도를 선택해주세요.`,
-      });
-      return;
-    }
-
-    emit('resize', {
-      attempt: attempt + 1,
-      message: `출력 크기 ${formatSize(sizeBytes)} — 설정을 낮춰 재시도합니다...`,
-    });
-
+    // Too large — try next FPS
     try { fs.unlinkSync(outputPath); } catch (e) {}
   }
 
-  // All attempts failed
-  emit('error', {
-    message: lastError
-      ? lastError.message
-      : '변환에 실패했습니다. 다른 동영상을 시도해주세요.',
+  if (!anySucceeded) {
+    emit('error', { message: 'GIF 변환에 실패했습니다. 다른 동영상을 시도해주세요.' });
+    return;
+  }
+
+  // All FPS steps exhausted — ask user to trim
+  const finalFps = fpsLadder[fpsLadder.length - 1];
+  emit('needs-trim', {
+    sizeBytes: lastSizeBytes,
+    sizeLabel: formatSize(lastSizeBytes),
+    finalFps,
+    message: `${formatSize(lastSizeBytes)} — 클립을 더 짧게 잘라주세요`,
   });
 }
 

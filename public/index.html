@@ -9,76 +9,129 @@
 <body>
   <div class="container">
     <header>
-      <h1>🎞 GIF Maker</h1>
-      <p class="subtitle">동영상을 고화질 GIF로 변환 &mdash; 트위터 업로드 (15MB 이하) 최적화</p>
+      <h1>GIF Maker</h1>
+      <p class="subtitle">동영상을 고화질 GIF로 변환 &mdash; 트위터 업로드 최적화</p>
+      <div class="wizard-steps" id="wizard-steps" hidden>
+        <div class="wizard-step" data-step="1" title="업로드"></div>
+        <div class="wizard-step" data-step="2" title="트림"></div>
+        <div class="wizard-step" data-step="3" title="색보정"></div>
+        <div class="wizard-step" data-step="4" title="변환"></div>
+      </div>
     </header>
 
-    <!-- Upload Section -->
-    <section id="upload-section">
+    <!-- Step 1: Upload -->
+    <section id="step-upload">
       <div id="drop-zone" role="button" tabindex="0" aria-label="동영상 파일을 업로드하려면 클릭하거나 드래그하세요">
         <div class="drop-icon">🎬</div>
-        <p class="drop-label">동영상을 여기에 드래그하거나 <span class="link">클릭하여 선택</span></p>
+        <p class="drop-label">동영상을 여기에 드래그하거나<br><span class="link">클릭하여 선택</span></p>
         <p class="drop-hint">MP4, MOV, AVI, WebM 등 지원 · 최대 500MB</p>
         <input type="file" id="file-input" accept="video/*" hidden />
       </div>
+    </section>
 
-      <div id="video-preview-wrap" hidden>
-        <video id="video-preview" controls muted playsinline></video>
-        <p id="video-info" class="video-info"></p>
+    <!-- Step 2: Trim -->
+    <section id="step-trim" hidden>
+      <div id="needs-trim-banner" class="needs-trim-banner" hidden></div>
+
+      <video id="video-preview" controls muted playsinline></video>
+
+      <div id="scrubber-wrap">
+        <div id="scrubber-strip">
+          <canvas id="scrubber-canvas"></canvas>
+          <div id="scrubber-range">
+            <div id="handle-start" class="scrubber-handle" role="slider" aria-label="시작 시간"></div>
+            <div id="handle-end" class="scrubber-handle" role="slider" aria-label="종료 시간"></div>
+          </div>
+        </div>
+        <div id="scrubber-labels">
+          <span id="label-start">0.0초</span>
+          <span id="label-duration">전체</span>
+          <span id="label-end">0.0초</span>
+        </div>
       </div>
 
-      <!-- Options -->
-      <div id="options-panel" hidden>
-        <h2>변환 옵션</h2>
-        <div class="options-grid">
-          <div class="option-group">
-            <label for="start-time">시작 시간 (초)</label>
-            <input type="number" id="start-time" min="0" step="0.1" value="0" />
-          </div>
-          <div class="option-group">
-            <label for="end-time">종료 시간 (초)</label>
-            <input type="number" id="end-time" min="0" step="0.1" value="" />
-          </div>
-          <div class="option-group">
-            <label for="fps">
-              FPS <span id="fps-value" class="badge">15</span>
-            </label>
-            <input type="range" id="fps" min="6" max="30" step="1" value="15" />
-            <div class="range-hints"><span>6</span><span>30</span></div>
-          </div>
-          <div class="option-group">
-            <label for="width">해상도 (가로)</label>
-            <select id="width">
-              <option value="320">320px (소형)</option>
-              <option value="480" selected>480px (권장)</option>
-              <option value="640">640px (중형)</option>
-              <option value="800">800px (대형)</option>
-              <option value="-1">원본 크기</option>
-            </select>
-          </div>
+      <div class="option-group">
+        <label>FPS 선택</label>
+        <div class="fps-group" role="group" aria-label="FPS 선택">
+          <button class="fps-btn" data-fps="30">30</button>
+          <button class="fps-btn" data-fps="24">24</button>
+          <button class="fps-btn" data-fps="20">20</button>
+          <button class="fps-btn active" data-fps="15">15</button>
+          <button class="fps-btn" data-fps="12">12</button>
+          <button class="fps-btn" data-fps="10">10</button>
+          <button class="fps-btn" data-fps="8">8</button>
+          <button class="fps-btn" data-fps="6">6</button>
         </div>
+      </div>
 
-        <div class="size-warning">
-          <span>⚠️</span>
-          파일이 15MB를 초과하면 자동으로 화질을 조정합니다.
-        </div>
-
-        <button id="convert-btn" class="btn btn-primary">GIF 변환 시작</button>
+      <div class="step-actions">
+        <button id="to-corrections-btn" class="btn btn-secondary">색보정 설정 →</button>
+        <button id="skip-corrections-btn" class="btn btn-primary">바로 변환 시작</button>
       </div>
     </section>
 
-    <!-- Progress Section -->
-    <section id="progress-section" hidden>
+    <!-- Step 3: Corrections -->
+    <section id="step-corrections" hidden>
+      <h2>색보정</h2>
+      <div class="corrections-grid">
+        <div class="option-group">
+          <label for="brightness">밝기 <span id="brightness-val" class="badge">0</span></label>
+          <input type="range" id="brightness" min="-1" max="1" step="0.05" value="0" />
+          <div class="range-hints"><span>어둡게</span><span>밝게</span></div>
+        </div>
+        <div class="option-group">
+          <label for="contrast">대비 <span id="contrast-val" class="badge">1.0</span></label>
+          <input type="range" id="contrast" min="0.5" max="2" step="0.05" value="1" />
+          <div class="range-hints"><span>낮음</span><span>높음</span></div>
+        </div>
+        <div class="option-group">
+          <label for="saturation">채도 <span id="saturation-val" class="badge">1.0</span></label>
+          <input type="range" id="saturation" min="0" max="3" step="0.05" value="1" />
+          <div class="range-hints"><span>흑백</span><span>선명</span></div>
+        </div>
+        <div class="option-group">
+          <label for="sharpness">선명도 <span id="sharpness-val" class="badge">0.0</span></label>
+          <input type="range" id="sharpness" min="0" max="2" step="0.1" value="0" />
+          <div class="range-hints"><span>없음</span><span>강하게</span></div>
+        </div>
+      </div>
+
+      <div class="step-actions">
+        <button id="back-to-trim-btn" class="btn btn-secondary">← 다시 자르기</button>
+        <button id="start-convert-btn" class="btn btn-primary">GIF 변환 시작</button>
+      </div>
+    </section>
+
+    <!-- Step 4: Converting -->
+    <section id="step-converting" hidden>
       <h2>변환 중...</h2>
       <div class="progress-bar-wrap">
         <div id="progress-bar" class="progress-bar" style="width: 0%"></div>
       </div>
       <p id="progress-message" class="progress-message">준비 중...</p>
       <div id="resize-notice" class="resize-notice" hidden></div>
+      <button id="cancel-btn" class="btn btn-secondary" style="margin-top:16px">취소</button>
     </section>
 
-    <!-- Result Section -->
-    <section id="result-section" hidden>
+    <!-- Interrupt: Needs Resolution -->
+    <section id="step-needs-res" hidden>
+      <div id="needs-res-banner" class="needs-trim-banner"></div>
+      <p class="option-group" style="margin-top:16px">해상도를 선택하세요:</p>
+      <div class="resolution-group">
+        <button class="resolution-btn" data-scale="0.9">90%</button>
+        <button class="resolution-btn" data-scale="0.8">80%</button>
+        <button class="resolution-btn" data-scale="0.7">70%</button>
+        <button class="resolution-btn" data-scale="0.6">60%</button>
+        <button class="resolution-btn" data-scale="0.5">50%</button>
+      </div>
+      <div class="step-actions" style="margin-top:20px">
+        <button id="back-to-trim-from-res-btn" class="btn btn-secondary">← 다시 자르기</button>
+        <button id="confirm-res-btn" class="btn btn-primary" disabled>이 해상도로 변환</button>
+      </div>
+    </section>
+
+    <!-- Result -->
+    <section id="step-result" hidden>
       <h2>변환 완료!</h2>
       <div id="result-meta" class="result-meta"></div>
       <div class="gif-preview-wrap">
@@ -90,8 +143,8 @@
       </div>
     </section>
 
-    <!-- Error Section -->
-    <section id="error-section" hidden>
+    <!-- Error -->
+    <section id="step-error" hidden>
       <div class="error-box">
         <div class="error-icon">❌</div>
         <p id="error-message"></p>
